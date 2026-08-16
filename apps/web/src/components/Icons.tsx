@@ -212,7 +212,11 @@ export const GrokIcon: Icon = ({ className, ...props }) => (
 );
 
 export const HermesIcon: Icon = ({ className, ...props }) => (
-  <svg {...props} viewBox="0 0 24 24" className={cn("fill-current", className)}>
+  <svg
+    {...props}
+    viewBox="0 0 24 24"
+    className={cn("fill-[#171717] dark:fill-[#e5e5e5]", className)}
+  >
     {/* Snakes drawn under the staff so the staff reads as the front of the wrap */}
     <path d="M7.8 7.0 C9.5 6.2 11.3 6.8 11.8 8.3 C12.3 9.8 11.3 11.0 10.0 11.8 C8.7 12.6 7.9 14.0 8.6 15.6 C9.3 17.2 10.9 17.8 12.5 17.1 L12.5 15.9 C11.3 16.4 10.2 15.9 9.8 14.8 C9.3 13.6 10.1 12.7 11.3 12.0 C12.5 11.3 13.2 10.1 12.8 9.0 C12.3 7.9 11.1 7.5 9.9 7.9 Z" />
     <path d="M16.2 7.0 C14.5 6.2 12.7 6.8 12.2 8.3 C11.7 9.8 12.7 11.0 14.0 11.8 C15.3 12.6 16.1 14.0 15.4 15.6 C14.7 17.2 13.1 17.8 11.5 17.1 L11.5 15.9 C12.7 16.4 13.8 15.9 14.2 14.8 C14.7 13.6 13.9 12.7 12.7 12.0 C11.5 11.3 10.8 10.1 11.2 9.0 C11.7 7.9 12.9 7.5 14.1 7.9 Z" />
