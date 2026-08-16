@@ -429,6 +429,13 @@ export function makeHermesAdapter(
         }
         yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
         sessions.delete(ctx.threadId);
+        // Release the per-thread semaphore so starting and stopping sessions
+        // does not grow threadLocksRef for the adapter's lifetime.
+        yield* SynchronizedRef.update(threadLocksRef, (current) => {
+          const next = new Map(current);
+          next.delete(ctx.threadId);
+          return next;
+        });
         yield* offerRuntimeEvent({
           type: "session.exited",
           ...(yield* makeEventStamp()),
@@ -840,6 +847,11 @@ export function makeHermesAdapter(
             }),
           );
           const { ctx, steeringTurnId, turnId, earlierPromptSettlements } = prepared;
+          const clearPhantomActiveTurn = () => {
+            if (steeringTurnId === undefined) {
+              ctx.activeTurnId = undefined;
+            }
+          };
 
           if (
             steeringTurnId !== undefined &&
@@ -860,6 +872,17 @@ export function makeHermesAdapter(
             // A stop that arrived while the previous prompt was settling must
             // not resurrect the turn with a fresh image prompt.
             if (ctx.interruptedTurnIds.has(turnId)) {
+              // The superseded prompt already skipped its completion (another
+              // prompt was in flight), so close the turn here or the thread
+              // would stay running forever.
+              yield* offerRuntimeEvent({
+                type: "turn.completed",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId,
+                payload: { state: "cancelled", stopReason: "cancelled" },
+              });
               return yield* new ProviderAdapterRequestError({
                 provider: PROVIDER,
                 method: "session/prompt",
@@ -878,6 +901,7 @@ export function makeHermesAdapter(
                 attachment,
               });
               if (!attachmentPath) {
+                clearPhantomActiveTurn();
                 return yield* new ProviderAdapterRequestError({
                   provider: PROVIDER,
                   method: "session/prompt",
@@ -885,6 +909,7 @@ export function makeHermesAdapter(
                 });
               }
               const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+                Effect.tapErrorCause(() => Effect.sync(clearPhantomActiveTurn)),
                 Effect.mapError(
                   (cause) =>
                     new ProviderAdapterRequestError({
@@ -905,13 +930,22 @@ export function makeHermesAdapter(
 
           if (promptParts.length === 0) {
             // A rejected turn must not leave a phantom active turn behind.
-            if (steeringTurnId === undefined) {
-              ctx.activeTurnId = undefined;
-            }
+            clearPhantomActiveTurn();
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
               operation: "sendTurn",
               issue: "Turn requires non-empty text or attachments.",
+            });
+          }
+
+          // A stop that arrived while the prompt was being prepared (attachment
+          // I/O or config) must not publish a turn.started afterwards.
+          if (ctx.interruptedTurnIds.has(turnId)) {
+            clearPhantomActiveTurn();
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "session/prompt",
+              detail: "Hermes prompt was interrupted during preparation.",
             });
           }
 
