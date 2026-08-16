@@ -121,7 +121,7 @@ export function buildHermesDiscoveredModelsFromSessionModelState(
     return [];
   }
   const seen = new Set<string>();
-  return modelState.availableModels
+  const discoveredModels = modelState.availableModels
     .map((model): ServerProviderModel | undefined => {
       const slug = resolveHermesModelId(model.modelId);
       if (!slug || seen.has(slug)) {
@@ -137,6 +137,11 @@ export function buildHermesDiscoveredModelsFromSessionModelState(
       };
     })
     .filter((model): model is ServerProviderModel => model !== undefined);
+  // When Hermes routes through its "default" entry, keep that routing selectable
+  // instead of forcing clients onto the first concrete discovered model.
+  return modelState.currentModelId === "default"
+    ? [...HERMES_BUILT_IN_MODELS, ...discoveredModels]
+    : discoveredModels;
 }
 
 export function hermesSlashCommands(

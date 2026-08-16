@@ -120,6 +120,8 @@ interface HermesSessionContext {
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   lastPlanFingerprint: string | undefined;
   activeTurnId: TurnId | undefined;
+  /** Turns already interrupted; a sendTurn preparing or awaiting settlement after a stop must not resurrect them. */
+  readonly interruptedTurnIds: Set<TurnId>;
   /** Number of sendTurn prompts currently in flight or being prepared.
    * >0 means a turn is actively running, so a new sendTurn is a steer that
    * continues it, and only the last remaining prompt settles the turn. */
@@ -531,7 +533,7 @@ export function makeHermesAdapter(
                 new ProviderAdapterProcessError({
                   provider: PROVIDER,
                   threadId: input.threadId,
-                  detail: cause.message,
+                  detail: "Failed to start the Hermes ACP session process.",
                   cause,
                 }),
             ),
@@ -647,6 +649,7 @@ export function makeHermesAdapter(
             turns: [],
             lastPlanFingerprint: undefined,
             activeTurnId: undefined,
+            interruptedTurnIds: new Set(),
             promptsInFlight: 0,
             promptSettlements: new Set(),
             stopped: false,
@@ -809,21 +812,35 @@ export function makeHermesAdapter(
 
     const sendTurn: HermesAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
-        const ctx = yield* requireSession(input.threadId);
-        // A sendTurn while a prompt is in flight is a steer: the agent folds
-        // the new prompt into the ongoing work, so the active turn id is
-        // reused instead of opening a new turn.
-        const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
-        const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
-        const earlierPromptSettlements = Array.from(ctx.promptSettlements);
         const promptSettlement = yield* Deferred.make<void>();
-        ctx.promptSettlements.add(promptSettlement);
-        // Count this prompt immediately so a superseded in-flight prompt
-        // resolving from here on does not settle the turn; the matching
-        // decrement is the `ensuring` below.
-        ctx.promptsInFlight += 1;
+        const run = Effect.gen(function* () {
+          // Accounting is serialized under the thread lock: a concurrent
+          // sendTurn must observe this prompt's turn id (and this prompt's
+          // in-flight count) atomically, or two prompts can both treat
+          // themselves as a fresh turn and emit duplicate `turn.started`.
+          const prepared = yield* withThreadLock(
+            input.threadId,
+            Effect.gen(function* () {
+              const ctx = yield* requireSession(input.threadId);
+              // A sendTurn while a prompt is in flight is a steer: the agent folds
+              // the new prompt into the ongoing work, so the active turn id is
+              // reused instead of opening a new turn.
+              const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
+              const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
+              const earlierPromptSettlements = Array.from(ctx.promptSettlements);
+              ctx.promptSettlements.add(promptSettlement);
+              // Count this prompt immediately so a superseded in-flight prompt
+              // resolving from here on does not settle the turn; the matching
+              // decrement is the `ensuring` below.
+              ctx.promptsInFlight += 1;
+              // Bind the turn id before any cooperative yield so interruptTurn
+              // can mark this prompt interrupted even while it is being prepared.
+              ctx.activeTurnId = turnId;
+              return { ctx, steeringTurnId, turnId, earlierPromptSettlements };
+            }),
+          );
+          const { ctx, steeringTurnId, turnId, earlierPromptSettlements } = prepared;
 
-        return yield* Effect.gen(function* () {
           if (
             steeringTurnId !== undefined &&
             (input.attachments?.length ?? 0) > 0 &&
@@ -831,13 +848,24 @@ export function makeHermesAdapter(
           ) {
             // Hermes can redirect text while active, but queues rich media as
             // a text placeholder. Stop the active request and wait for its RPC
-            // to settle before submitting the intact image blocks.
+            // to settle before submitting the intact image blocks. This wait is
+            // deliberately outside the thread lock so interruptTurn can still
+            // cancel while it is in progress.
             yield* ctx.acp
               .notify("session/cancel", { sessionId: ctx.acpSessionId })
               .pipe(Effect.ignore);
             yield* Effect.forEach(earlierPromptSettlements, Deferred.await, {
               discard: true,
             });
+            // A stop that arrived while the previous prompt was settling must
+            // not resurrect the turn with a fresh image prompt.
+            if (ctx.interruptedTurnIds.has(turnId)) {
+              return yield* new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session/prompt",
+                detail: "Hermes image steer was interrupted.",
+              });
+            }
           }
           const turnModelSelection =
             input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
@@ -855,7 +883,6 @@ export function makeHermesAdapter(
             mapError: ({ cause, method }) =>
               mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
           });
-          ctx.activeTurnId = turnId;
           if (steeringTurnId === undefined) {
             ctx.lastPlanFingerprint = undefined;
           }
@@ -899,7 +926,7 @@ export function makeHermesAdapter(
                     new ProviderAdapterRequestError({
                       provider: PROVIDER,
                       method: "session/prompt",
-                      detail: cause.message,
+                      detail: "Failed to read attachment file.",
                       cause,
                     }),
                 ),
@@ -930,64 +957,84 @@ export function makeHermesAdapter(
               ),
             );
 
-          const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
-          if (turnRecord) {
-            turnRecord.items.push({ prompt: promptParts, result });
-          } else {
-            ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
-          }
-          ctx.session = {
-            ...ctx.session,
-            activeTurnId: turnId,
-            updatedAt: yield* nowIso,
-            model: resolvedModel,
-          };
+          return yield* withThreadLock(
+            input.threadId,
+            Effect.gen(function* () {
+              const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
+              if (turnRecord) {
+                turnRecord.items.push({ prompt: promptParts, result });
+              } else {
+                ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
+              }
+              ctx.session = {
+                ...ctx.session,
+                activeTurnId: turnId,
+                updatedAt: yield* nowIso,
+                model: resolvedModel,
+              };
 
-          // Only the last remaining prompt settles the turn — a steer-
-          // superseded prompt resolving (usually cancelled) while another is
-          // in flight or pending must leave the merged turn running.
-          if (ctx.promptsInFlight === 1) {
-            yield* offerRuntimeEvent({
-              type: "turn.completed",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
-              threadId: input.threadId,
-              turnId,
-              payload: {
-                state: result.stopReason === "cancelled" ? "cancelled" : "completed",
-                stopReason: result.stopReason ?? null,
-              },
-            });
-          }
+              // Only the last remaining prompt settles the turn — a steer-
+              // superseded prompt resolving (usually cancelled) while another is
+              // in flight or pending must leave the merged turn running.
+              if (ctx.promptsInFlight === 1) {
+                yield* offerRuntimeEvent({
+                  type: "turn.completed",
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  turnId,
+                  payload: {
+                    state: result.stopReason === "cancelled" ? "cancelled" : "completed",
+                    stopReason: result.stopReason ?? null,
+                  },
+                });
+              }
 
-          return {
-            threadId: input.threadId,
-            turnId,
-            resumeCursor: ctx.session.resumeCursor,
-          };
-        }).pipe(
+              return {
+                threadId: input.threadId,
+                turnId,
+                resumeCursor: ctx.session.resumeCursor,
+              };
+            }),
+          );
+        });
+        return yield* run.pipe(
           Effect.ensuring(
-            Effect.sync(() => {
-              ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
-              ctx.promptSettlements.delete(promptSettlement);
-            }).pipe(Effect.andThen(Deferred.succeed(promptSettlement, undefined)), Effect.asVoid),
+            withThreadLock(
+              input.threadId,
+              Effect.sync(() => {
+                const ctx = sessions.get(input.threadId);
+                if (!ctx) {
+                  return;
+                }
+                ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
+                ctx.promptSettlements.delete(promptSettlement);
+              }).pipe(Effect.andThen(Deferred.succeed(promptSettlement, undefined)), Effect.asVoid),
+            ),
           ),
         );
       });
 
     const interruptTurn: HermesAdapterShape["interruptTurn"] = (threadId) =>
-      Effect.gen(function* () {
-        const ctx = yield* requireSession(threadId);
-        yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
-        yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
-        yield* Effect.ignore(
-          ctx.acp.cancel.pipe(
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
+      withThreadLock(
+        threadId,
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(threadId);
+          const interruptedTurnId = ctx.activeTurnId;
+          if (interruptedTurnId !== undefined) {
+            ctx.interruptedTurnIds.add(interruptedTurnId);
+          }
+          yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
+          yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+          yield* Effect.ignore(
+            ctx.acp.cancel.pipe(
+              Effect.mapError((error) =>
+                mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
+              ),
             ),
-          ),
-        );
-      });
+          );
+        }),
+      );
 
     const respondToRequest: HermesAdapterShape["respondToRequest"] = (
       threadId,

@@ -143,7 +143,7 @@ export const HermesDriver: ProviderDriver<HermesSettings, HermesDriverEnv> = {
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: `Failed to build Hermes snapshot: ${cause.message ?? String(cause)}`,
+              detail: "Failed to build the Hermes provider snapshot.",
               cause,
             }),
         ),
